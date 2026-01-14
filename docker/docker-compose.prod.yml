@@ -1,0 +1,432 @@
+# =============================================================================
+# StreamHub - Docker Compose for Production Deployment
+# =============================================================================
+# Production-optimized configuration with:
+# - Optimized container images
+# - Security hardening
+# - Resource limits and reservations
+# - Proper logging configuration
+# - Traefik reverse proxy with SSL
+#
+# Usage:
+#   docker-compose -f docker-compose.prod.yml up -d
+#   docker-compose -f docker-compose.prod.yml logs -f
+#   docker-compose -f docker-compose.prod.yml down
+# =============================================================================
+
+version: "3.9"
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  # Internal network for service communication
+  streamhub-internal:
+    name: streamhub-internal
+    driver: bridge
+    internal: true  # No external access
+  
+  # External network for proxy
+  streamhub-proxy:
+    name: streamhub-proxy
+    driver: bridge
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  postgres_data:
+    name: streamhub-prod-postgres-data
+  redis_data:
+    name: streamhub-prod-redis-data
+  traefik_certs:
+    name: streamhub-traefik-certs
+
+# =============================================================================
+# Common Configuration Anchors
+# =============================================================================
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "10"
+    tag: "{{.Name}}"
+
+x-common-deploy: &common-deploy
+  restart_policy:
+    condition: on-failure
+    delay: 5s
+    max_attempts: 3
+    window: 120s
+  update_config:
+    parallelism: 1
+    delay: 10s
+    failure_action: rollback
+    order: start-first
+
+# =============================================================================
+# Services
+# =============================================================================
+services:
+  # ---------------------------------------------------------------------------
+  # Traefik - Reverse Proxy & Load Balancer
+  # ---------------------------------------------------------------------------
+  traefik:
+    image: traefik:v3.0
+    container_name: streamhub-traefik
+    restart: always
+    
+    command:
+      # API and Dashboard
+      - "--api.dashboard=true"
+      - "--api.insecure=false"
+      # Docker provider
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=streamhub-proxy"
+      # Entrypoints
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      # HTTP to HTTPS redirect
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      # Let's Encrypt
+      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/certs/acme.json"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+      # Logging
+      - "--log.level=INFO"
+      - "--accesslog=true"
+    
+    ports:
+      - "80:80"
+      - "443:443"
+    
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_certs:/certs
+    
+    networks:
+      - streamhub-proxy
+    
+    logging: *default-logging
+    
+    labels:
+      - "traefik.enable=true"
+      # Dashboard
+      - "traefik.http.routers.traefik.rule=Host(`traefik.${DOMAIN}`)"
+      - "traefik.http.routers.traefik.entrypoints=websecure"
+      - "traefik.http.routers.traefik.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.traefik.service=api@internal"
+      - "traefik.http.routers.traefik.middlewares=auth"
+      - "traefik.http.middlewares.auth.basicauth.users=${TRAEFIK_AUTH}"
+    
+    deploy:
+      <<: *common-deploy
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+    
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL Database
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: streamhub-postgres-prod
+    restart: always
+    
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # Security: Only allow connections from internal network
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+    
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts/postgres:/docker-entrypoint-initdb.d:ro
+    
+    networks:
+      - streamhub-internal
+    
+    # No port exposure - only internal access
+    expose:
+      - "5432"
+    
+    logging: *default-logging
+    
+    deploy:
+      <<: *common-deploy
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2'
+        reservations:
+          memory: 1G
+          cpus: '0.5'
+    
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+
+  # ---------------------------------------------------------------------------
+  # Redis
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: streamhub-redis-prod
+    restart: always
+    
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 2gb
+      --maxmemory-policy volatile-lru
+      --tcp-keepalive 300
+      --timeout 0
+      --requirepass ${REDIS_PASSWORD}
+    
+    volumes:
+      - redis_data:/data
+    
+    networks:
+      - streamhub-internal
+    
+    expose:
+      - "6379"
+    
+    logging: *default-logging
+    
+    deploy:
+      <<: *common-deploy
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1'
+        reservations:
+          memory: 512M
+          cpus: '0.25'
+    
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    
+    security_opt:
+      - no-new-privileges:true
+
+  # ---------------------------------------------------------------------------
+  # FastAPI Backend
+  # ---------------------------------------------------------------------------
+  api:
+    image: ${REGISTRY:-ghcr.io}/${IMAGE_PREFIX:-streamhub}/api:${VERSION:-latest}
+    container_name: streamhub-api-prod
+    restart: always
+    
+    build:
+      context: ../backend
+      dockerfile: ../docker/Dockerfile.api
+      target: production
+      args:
+        - BUILD_DATE=${BUILD_DATE}
+        - VERSION=${VERSION}
+    
+    env_file:
+      - .env.prod
+    
+    environment:
+      - APP_ENV=production
+      - DEBUG=false
+      - LOG_LEVEL=INFO
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - CACHE_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/1
+      - QUEUE_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/2
+    
+    networks:
+      - streamhub-internal
+      - streamhub-proxy
+    
+    expose:
+      - "8000"
+    
+    logging: *default-logging
+    
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api.rule=Host(`api.${DOMAIN}`)"
+      - "traefik.http.routers.api.entrypoints=websecure"
+      - "traefik.http.routers.api.tls.certresolver=letsencrypt"
+      - "traefik.http.services.api.loadbalancer.server.port=8000"
+      # Rate limiting
+      - "traefik.http.middlewares.api-ratelimit.ratelimit.average=100"
+      - "traefik.http.middlewares.api-ratelimit.ratelimit.burst=50"
+      - "traefik.http.routers.api.middlewares=api-ratelimit"
+    
+    deploy:
+      <<: *common-deploy
+      replicas: 2
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    security_opt:
+      - no-new-privileges:true
+    
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/logs
+
+  # ---------------------------------------------------------------------------
+  # Content Worker
+  # ---------------------------------------------------------------------------
+  worker:
+    image: ${REGISTRY:-ghcr.io}/${IMAGE_PREFIX:-streamhub}/api:${VERSION:-latest}
+    container_name: streamhub-worker-prod
+    restart: always
+    
+    command: python -m src.workers.content_processor
+    
+    env_file:
+      - .env.prod
+    
+    environment:
+      - APP_ENV=production
+      - DEBUG=false
+      - LOG_LEVEL=INFO
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - QUEUE_REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/2
+      - WORKER_CONCURRENCY=8
+      - WORKER_BATCH_SIZE=20
+    
+    networks:
+      - streamhub-internal
+    
+    logging: *default-logging
+    
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    
+    deploy:
+      <<: *common-deploy
+      replicas: 2
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+    
+    security_opt:
+      - no-new-privileges:true
+    
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  # ---------------------------------------------------------------------------
+  # Next.js Frontend
+  # ---------------------------------------------------------------------------
+  frontend:
+    image: ${REGISTRY:-ghcr.io}/${IMAGE_PREFIX:-streamhub}/frontend:${VERSION:-latest}
+    container_name: streamhub-frontend-prod
+    restart: always
+    
+    build:
+      context: ../frontend
+      dockerfile: ../docker/Dockerfile.frontend
+      target: runner
+      args:
+        - NEXT_PUBLIC_API_URL=https://api.${DOMAIN}
+        - NEXT_PUBLIC_WS_URL=wss://api.${DOMAIN}
+    
+    environment:
+      - NODE_ENV=production
+    
+    networks:
+      - streamhub-proxy
+    
+    expose:
+      - "3000"
+    
+    logging: *default-logging
+    
+    depends_on:
+      - api
+    
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=Host(`${DOMAIN}`) || Host(`www.${DOMAIN}`)"
+      - "traefik.http.routers.frontend.entrypoints=websecure"
+      - "traefik.http.routers.frontend.tls.certresolver=letsencrypt"
+      - "traefik.http.services.frontend.loadbalancer.server.port=3000"
+      # Redirect www to non-www
+      - "traefik.http.middlewares.www-redirect.redirectregex.regex=^https://www\\.(.*)"
+      - "traefik.http.middlewares.www-redirect.redirectregex.replacement=https://$${1}"
+      - "traefik.http.routers.frontend.middlewares=www-redirect"
+    
+    deploy:
+      <<: *common-deploy
+      replicas: 2
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    
+    security_opt:
+      - no-new-privileges:true
+    
+    read_only: true
+    tmpfs:
+      - /tmp
