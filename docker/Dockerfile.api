@@ -1,0 +1,137 @@
+# =============================================================================
+# StreamHub API - FastAPI Backend Dockerfile
+# =============================================================================
+# Multi-stage build for optimized production image
+# Uses non-root user for security
+# Includes health checks for container orchestration
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Stage 1: Builder - Install dependencies and build wheels
+# -----------------------------------------------------------------------------
+FROM python:3.11-slim-bookworm AS builder
+
+# Set environment variables for Python
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Copy requirements and install dependencies
+WORKDIR /build
+COPY requirements.txt .
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install -r requirements.txt
+
+# -----------------------------------------------------------------------------
+# Stage 2: Production - Minimal runtime image
+# -----------------------------------------------------------------------------
+FROM python:3.11-slim-bookworm AS production
+
+# Labels for container metadata
+LABEL maintainer="StreamHub Team" \
+      version="1.0" \
+      description="StreamHub API - Content Aggregation Backend"
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONFAULTHANDLER=1 \
+    # Application settings
+    APP_HOME=/app \
+    APP_USER=streamhub \
+    APP_GROUP=streamhub \
+    # Default port
+    PORT=8000
+
+# Install runtime dependencies only
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    curl \
+    # Clean up
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Create non-root user for security
+# Running as root in containers is a security risk
+RUN groupadd --gid 1000 ${APP_GROUP} && \
+    useradd --uid 1000 --gid ${APP_GROUP} --shell /bin/bash --create-home ${APP_USER}
+
+# Copy virtual environment from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Set working directory
+WORKDIR ${APP_HOME}
+
+# Copy application code
+COPY --chown=${APP_USER}:${APP_GROUP} ./src ./src
+COPY --chown=${APP_USER}:${APP_GROUP} ./alembic ./alembic
+COPY --chown=${APP_USER}:${APP_GROUP} ./alembic.ini .
+COPY --chown=${APP_USER}:${APP_GROUP} ./scripts ./scripts
+
+# Create necessary directories
+RUN mkdir -p /app/logs /app/data && \
+    chown -R ${APP_USER}:${APP_GROUP} /app
+
+# Switch to non-root user
+USER ${APP_USER}
+
+# Expose the application port
+EXPOSE ${PORT}
+
+# Health check configuration
+# Checks if the API is responding to requests
+# - interval: Check every 30 seconds
+# - timeout: Wait up to 10 seconds for response
+# - start_period: Wait 40 seconds before first check (for startup)
+# - retries: Mark unhealthy after 3 consecutive failures
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:${PORT}/health || exit 1
+
+# Default command - run with uvicorn
+# Workers are set via environment variable for flexibility
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+
+# -----------------------------------------------------------------------------
+# Stage 3: Development - Includes dev tools
+# -----------------------------------------------------------------------------
+FROM production AS development
+
+# Switch back to root to install dev dependencies
+USER root
+
+# Install development tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    vim \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install development Python packages
+RUN pip install \
+    pytest \
+    pytest-asyncio \
+    pytest-cov \
+    black \
+    isort \
+    flake8 \
+    mypy \
+    ipython \
+    debugpy
+
+# Switch back to non-root user
+USER ${APP_USER}
+
+# Development command with hot reload
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
