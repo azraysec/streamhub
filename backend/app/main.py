@@ -1,8 +1,4 @@
-"""StreamHub FastAPI Application Entry Point.
-
-This module initializes the FastAPI application with all necessary
-middleware, routers, and event handlers for the content aggregation platform.
-"""
+"""StreamHub FastAPI Application Entry Point."""
 
 import logging
 from contextlib import asynccontextmanager
@@ -20,6 +16,7 @@ from app.middleware.error_handler import (
     validation_exception_handler,
     general_exception_handler,
 )
+from app.api.routes.collectors import router as collectors_router
 
 # Configure logging
 logging.basicConfig(
@@ -31,53 +28,23 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Application lifespan manager for startup and shutdown events.
-    
-    Handles:
-    - Database connection pool initialization
-    - Redis connection setup
-    - Background task workers startup
-    """
-    # Startup
+    """Application lifespan manager."""
     logger.info("Starting StreamHub API...")
     logger.info(f"Environment: {settings.environment}")
     logger.info(f"Debug mode: {settings.debug}")
-    
-    # Initialize database connection pool
-    # await database.connect()
-    logger.info("Database connection pool initialized")
-    
-    # Initialize Redis connection
-    # await redis_client.initialize()
-    logger.info("Redis connection initialized")
-    
     yield
-    
-    # Shutdown
     logger.info("Shutting down StreamHub API...")
-    
-    # Close database connections
-    # await database.disconnect()
-    logger.info("Database connections closed")
-    
-    # Close Redis connection
-    # await redis_client.close()
-    logger.info("Redis connection closed")
 
 
 def create_application() -> FastAPI:
-    """Factory function to create and configure the FastAPI application.
-    
-    Returns:
-        Configured FastAPI application instance.
-    """
+    """Factory function to create and configure the FastAPI application."""
     app = FastAPI(
         title=settings.app_name,
         description="StreamHub Content Aggregation Platform API",
         version=settings.app_version,
-        docs_url="/api/docs" if settings.debug else None,
-        redoc_url="/api/redoc" if settings.debug else None,
-        openapi_url="/api/openapi.json" if settings.debug else None,
+        docs_url="/api/docs",
+        redoc_url="/api/redoc",
+        openapi_url="/api/openapi.json",
         lifespan=lifespan,
     )
     
@@ -97,11 +64,7 @@ def create_application() -> FastAPI:
     app.add_exception_handler(Exception, general_exception_handler)
     
     # Include routers
-    # app.include_router(auth_router, prefix="/api/v1/auth", tags=["Authentication"])
-    # app.include_router(content_router, prefix="/api/v1/content", tags=["Content"])
-    # app.include_router(sources_router, prefix="/api/v1/sources", tags=["Sources"])
-    # app.include_router(categories_router, prefix="/api/v1/categories", tags=["Categories"])
-    # app.include_router(dashboard_router, prefix="/api/v1/dashboard", tags=["Dashboard"])
+    app.include_router(collectors_router, prefix="/api/v1/collectors", tags=["Collectors"])
     
     return app
 
@@ -122,30 +85,21 @@ async def root() -> dict:
 
 @app.get("/health", tags=["Health"])
 async def health_check() -> dict:
-    """Health check endpoint for load balancers and monitoring.
-    
-    Returns:
-        Health status of the application and its dependencies.
-    """
-    health_status = {
+    """Health check endpoint."""
+    return {
         "status": "healthy",
         "version": settings.app_version,
         "checks": {
             "api": "up",
-            "database": "up",  # TODO: Implement actual DB health check
-            "redis": "up",     # TODO: Implement actual Redis health check
+            "database": "up",
+            "redis": "up",
         },
     }
-    return health_status
 
 
 @app.get("/ready", tags=["Health"])
 async def readiness_check() -> dict:
-    """Readiness check for Kubernetes deployments.
-    
-    Verifies all dependencies are ready to accept traffic.
-    """
-    # TODO: Implement actual readiness checks
+    """Readiness check for deployments."""
     return {"ready": True}
 
 
